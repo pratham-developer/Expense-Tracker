@@ -5,6 +5,15 @@ import './App.css';
 function App() {
   const auth = useAuth();
 
+  const signOut = () => {
+    const clientId = import.meta.env.VITE_COGNITO_CLIENT_ID;
+    const logoutUri = import.meta.env.VITE_COGNITO_REDIRECT_URI;
+    const cognitoDomain = import.meta.env.VITE_COGNITO_DOMAIN;
+
+    auth.removeUser();
+    window.location.href = `${cognitoDomain}/logout?client_id=${clientId}&logout_uri=${encodeURIComponent(logoutUri)}`;
+  };
+
   if (auth.isLoading) {
     return (
       <div className="splash-screen">
@@ -38,7 +47,7 @@ function App() {
   }
 
   if (auth.isAuthenticated) {
-    return <Dashboard user={auth.user} signOut={() => auth.removeUser()} />;
+    return <Dashboard user={auth.user} signOut={signOut} />;
   }
 
   return (
