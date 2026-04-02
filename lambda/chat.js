@@ -1,12 +1,16 @@
-import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+// chat.js — COMPLETE FILE
+import { DynamoDBClient, QueryCommand, ScanCommand }      from "@aws-sdk/client-dynamodb";
+import { ChatGoogleGenerativeAI }                          from "@langchain/google-genai";
+import { DynamoDBChatMessageHistory }                      from "@langchain/community/stores/message/dynamodb";
+import { RunnableWithMessageHistory }                      from "@langchain/core/runnables";
+import { ChatPromptTemplate, MessagesPlaceholder }         from "@langchain/core/prompts";
+import { StringOutputParser }                              from "@langchain/core/output_parsers";
 
-const client = new DynamoDBClient();
+const dbClient     = new DynamoDBClient();
+const TABLE        = process.env.DYNAMODB_TABLE || "Expenses";
+const MEMORY_TABLE = process.env.MEMORY_TABLE   || "XpenseMemory";
+const GEMINI_MODEL = process.env.GEMINI_MODEL   || "gemini-2.5-flash";
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const TABLE          = process.env.DYNAMODB_TABLE || "Expenses";
-const GEMINI_MODEL   = process.env.GEMINI_MODEL   || "gemini-2.5-flash";
-
-// ── Utilities ─────────────────────────────────────────────────────────────────
 const log = (level, msg, data = {}) =>
   console[level](JSON.stringify({ level: level.toUpperCase(), msg, ...data }));
 
@@ -19,24 +23,23 @@ const CORS_HEADERS = {
 const respond = (statusCode, body) => ({
   statusCode,
   headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-  body: typeof body === "string" ? body : JSON.stringify(body),
+  body: JSON.stringify(body),
 });
 
-// ── Fetch all user expenses from DynamoDB (paginated) ─────────────────────────
+// ── Fetch all expenses ────────────────────────────────────────────────────────
 const fetchExpenses = async (userId) => {
   const expenses = [];
   let lastKey    = undefined;
 
   do {
-    const res = await client.send(new QueryCommand({
-      TableName: TABLE,
-      KeyConditionExpression: "userId = :uid",
+    const res = await dbClient.send(new QueryCommand({
+      TableName:                 TABLE,
+      KeyConditionExpression:    "userId = :uid",
       ExpressionAttributeValues: { ":uid": { S: userId } },
-      ExclusiveStartKey: lastKey,
+      ExclusiveStartKey:         lastKey,
     }));
 
     for (const item of res.Items ?? []) {
-      // Skip internal lock records
       if (item.userId?.S === "__lock__") continue;
 
       let lineItems = [];
@@ -48,7 +51,8 @@ const fetchExpenses = async (userId) => {
         date:        item.date?.S       ?? "",
         total:       parseFloat(item.total?.N ?? "0"),
         summary:     item.summary?.S    ?? "",
-        items:       lineItems,          // ← CRITICAL: full line items included
+        category:    item.category?.S   ?? "Other",
+        items:       lineItems,
         processedAt: item.processedAt?.S ?? "",
       });
     }
@@ -58,64 +62,60 @@ const fetchExpenses = async (userId) => {
   return expenses.sort((a, b) => new Date(b.date) - new Date(a.date));
 };
 
-// ── Build rich analytics context for the AI ───────────────────────────────────
+// ── Analytics ─────────────────────────────────────────────────────────────────
 const buildAnalytics = (expenses) => {
   if (!expenses.length) return null;
 
-  const fmt = (n) => `$${n.toFixed(2)}`;
-
-  // Total spend
+  const fmt        = (n) => `$${n.toFixed(2)}`;
   const grandTotal = expenses.reduce((s, e) => s + e.total, 0);
 
-  // Spend by merchant
   const byMerchant = {};
   for (const e of expenses) {
     byMerchant[e.merchant] = (byMerchant[e.merchant] ?? 0) + e.total;
   }
   const topMerchants = Object.entries(byMerchant)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([name, total]) => `${name}: ${fmt(total)}`)
-    .join(", ");
+    .sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([name, total]) => `${name}: ${fmt(total)}`).join(", ");
 
-  // Spend by month
   const byMonth = {};
   for (const e of expenses) {
-    const month = e.date.slice(0, 7); // "YYYY-MM"
+    const month = e.date.slice(0, 7);
     byMonth[month] = (byMonth[month] ?? 0) + e.total;
   }
   const monthlyBreakdown = Object.entries(byMonth)
-    .sort((a, b) => b[0].localeCompare(a[0]))
-    .slice(0, 6)
-    .map(([m, t]) => `${m}: ${fmt(t)}`)
-    .join(", ");
+    .sort((a, b) => b[0].localeCompare(a[0])).slice(0, 6)
+    .map(([m, t]) => `${m}: ${fmt(t)}`).join(", ");
 
-  // This month
-  const now      = new Date();
-  const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const byCategory = {};
+  for (const e of expenses) {
+    const cat = e.category || "Other";
+    byCategory[cat] = (byCategory[cat] ?? 0) + e.total;
+  }
+  const categoryBreakdown = Object.entries(byCategory)
+    .sort((a, b) => b[1] - a[1])
+    .map(([cat, total]) => `${cat}: ${fmt(total)}`).join(", ");
+
+  const now            = new Date();
+  const thisMonth      = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
   const thisMonthTotal = byMonth[thisMonth] ?? 0;
 
-  // All individual line items across all receipts
   const allItems = expenses.flatMap((e) =>
     (e.items ?? []).map((i) => ({
       receiptDate: e.date,
       merchant:    e.merchant,
+      category:    e.category,
       name:        i.name,
       price:       parseFloat(i.price ?? 0),
     }))
   );
 
-  // Top individual items by price
   const topItems = [...allItems]
-    .sort((a, b) => b.price - a.price)
-    .slice(0, 10)
-    .map((i) => `${i.name} from ${i.merchant} (${i.receiptDate}): $${i.price.toFixed(2)}`)
-    .join("\n    ");
+    .sort((a, b) => b.price - a.price).slice(0, 10)
+    .map((i) => `${i.name} from ${i.merchant} (${i.receiptDate}): $${i.price.toFixed(2)}`).join("\n    ");
 
-  return { grandTotal, topMerchants, monthlyBreakdown, thisMonthTotal, allItems, fmt };
+  return { grandTotal, topMerchants, monthlyBreakdown, categoryBreakdown, thisMonthTotal, allItems, topItems, fmt };
 };
 
-// ── Format all expenses as structured text for the AI prompt ──────────────────
 const buildExpenseContext = (expenses) => {
   if (!expenses.length) return "No expenses found for this user.";
 
@@ -124,118 +124,176 @@ const buildExpenseContext = (expenses) => {
       ? e.items.map((i) => `      • ${i.name}: $${parseFloat(i.price ?? 0).toFixed(2)}`).join("\n")
       : "      (no line items)";
 
-    return `${idx + 1}. [${e.date}] ${e.merchant} — Total: $${e.total.toFixed(2)}
+    return `${idx + 1}. [${e.date}] ${e.merchant} (${e.category}) — Total: $${e.total.toFixed(2)}
    Summary: ${e.summary}
    Line Items:\n${itemLines}`;
   }).join("\n\n");
 };
 
-// ── Basic prompt injection guard ──────────────────────────────────────────────
+const buildAnalyticsSection = (analytics) => `
+── SPENDING ANALYTICS ──────────────────────────────────────
+Grand Total (all time)   : ${analytics.fmt(analytics.grandTotal)}
+This Month               : ${analytics.fmt(analytics.thisMonthTotal)}
+Top Merchants            : ${analytics.topMerchants}
+By Category              : ${analytics.categoryBreakdown}
+Monthly Breakdown (last 6): ${analytics.monthlyBreakdown}
+Total Line Items on file : ${analytics.allItems.length}
+
+Top 10 Highest-Priced Items:
+    ${analytics.topItems || "N/A"}
+────────────────────────────────────────────────────────────`;
+
 const sanitizeQuestion = (q) => {
-  const MAX_LEN    = 500;
-  const BLOCKLIST  = /ignore (previous|above|all) instructions/i;
-  const trimmed    = q.trim().slice(0, MAX_LEN);
-  if (BLOCKLIST.test(trimmed)) throw new Error("Invalid question content");
+  const trimmed = q.trim().slice(0, 2000); // increased limit for forecast prompts
+  if (/ignore (previous|above|all) instructions/i.test(trimmed))
+    throw new Error("Invalid question content");
   return trimmed;
+};
+
+const buildChain = (expenseContext, analyticsSection) => {
+  const llm = new ChatGoogleGenerativeAI({
+    model:           GEMINI_MODEL,
+    apiKey:          process.env.GEMINI_API_KEY,
+    temperature:     0.2,
+    maxOutputTokens: 1024,
+  });
+
+  const prompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      `You are Xpense AI, a friendly and precise personal finance assistant.
+You only answer questions based on the expense data provided below.
+Be concise, friendly, and format numbers as currency (e.g. $12.50).
+You remember this conversation — refer to previous messages naturally when relevant.
+
+IMPORTANT: When asked to forecast or predict future spending, you MUST produce estimates.
+Use historical averages and category proportions to project — never refuse to estimate.
+
+${analyticsSection}
+
+── FULL EXPENSE HISTORY ──────────────────────────────────────
+${expenseContext}
+─────────────────────────────────────────────────────────────`,
+    ],
+    new MessagesPlaceholder("history"),
+    ["human", "{question}"],
+  ]);
+
+  return prompt.pipe(llm).pipe(new StringOutputParser());
 };
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 export const handler = async (event) => {
-  // CORS preflight
   if (event.httpMethod === "OPTIONS") return respond(200, "");
 
-  if (!GEMINI_API_KEY) {
+  if (!process.env.GEMINI_API_KEY) {
     log("error", "GEMINI_API_KEY not set");
     return respond(500, { error: "Server configuration error" });
   }
 
   let body;
-  try {
-    body = JSON.parse(event.body ?? "{}");
-  } catch {
-    return respond(400, { error: "Invalid JSON body" });
+  try { body = JSON.parse(event.body ?? "{}"); }
+  catch { return respond(400, { error: "Invalid JSON body" }); }
+
+  // ── Action: listSessions ───────────────────────────────────────────────────
+  if (body.action === "listSessions") {
+    const { userId } = body;
+    if (!userId) return respond(400, { error: "Missing userId" });
+
+    try {
+      const res = await dbClient.send(new ScanCommand({
+        TableName:        MEMORY_TABLE,
+        FilterExpression: "begins_with(sessionId, :prefix)",
+        ExpressionAttributeValues: { ":prefix": { S: userId } },
+        ProjectionExpression: "sessionId",
+      }));
+
+      const sessions = [...new Set(
+        (res.Items ?? [])
+          .map((i) => i.sessionId?.S)
+          .filter((s) => s && !s.includes("#forecast"))
+      )].sort((a, b) => b.localeCompare(a)).slice(0, 30);
+
+      log("info", "listSessions complete", { userId, count: sessions.length });
+      return respond(200, { sessions });
+    } catch (err) {
+      log("error", "listSessions failed", { error: err.message });
+      return respond(500, { error: "Failed to list sessions" });
+    }
   }
 
-  const { question: rawQuestion, userId } = body;
+  // ── Action: getSession ─────────────────────────────────────────────────────
+  if (body.action === "getSession") {
+    const { userId, sessionId: sid } = body;
+    if (!userId || !sid) return respond(400, { error: "Missing userId or sessionId" });
+    if (!sid.startsWith(userId)) return respond(403, { error: "Forbidden" });
 
-  if (!rawQuestion || !userId) {
+    try {
+      const history = new DynamoDBChatMessageHistory({
+        tableName:    MEMORY_TABLE,
+        sessionId:    sid,
+        partitionKey: "sessionId",
+        config: { region: process.env.AWS_REGION || "us-east-1" },
+      });
+      const msgs       = await history.getMessages();
+      const serialized = msgs.map((m) => ({
+        role: m._getType() === "human" ? "user" : "ai",
+        text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+      }));
+      log("info", "getSession complete", { sid, count: serialized.length });
+      return respond(200, { messages: serialized, sessionId: sid });
+    } catch (err) {
+      log("error", "getSession failed", { error: err.message });
+      return respond(500, { error: "Failed to load session" });
+    }
+  }
+
+  // ── Main chat ──────────────────────────────────────────────────────────────
+  const { question: rawQuestion, userId, sessionId: rawSession } = body;
+
+  if (!rawQuestion || !userId)
     return respond(400, { error: "Missing required fields: question, userId" });
-  }
+
+  const today     = new Date().toISOString().slice(0, 10);
+  const sessionId = rawSession || `${userId}#${today}`;
 
   let question;
-  try {
-    question = sanitizeQuestion(rawQuestion);
-  } catch (e) {
-    return respond(400, { error: e.message });
-  }
+  try { question = sanitizeQuestion(rawQuestion); }
+  catch (e) { return respond(400, { error: e.message }); }
 
-  log("info", "Chat request", { userId, questionLength: question.length });
+  log("info", "Chat request", { userId, sessionId, questionLength: question.length });
 
   try {
-    // ── 1. Fetch full expense data ─────────────────────────────────────────
-    const expenses    = await fetchExpenses(userId);
-    const analytics   = buildAnalytics(expenses);
-    const expContext  = buildExpenseContext(expenses);
+    const expenses         = await fetchExpenses(userId);
+    const analytics        = buildAnalytics(expenses);
+    const expContext       = buildExpenseContext(expenses);
+    const analyticsSection = analytics ? buildAnalyticsSection(analytics) : "No expense data yet.";
 
     log("info", "Data loaded", { userId, expenseCount: expenses.length });
 
-    // ── 2. Build rich prompt ───────────────────────────────────────────────
-    const analyticsSection = analytics ? `
-── SPENDING ANALYTICS ──────────────────────────────────────
-Grand Total (all time): ${analytics.fmt(analytics.grandTotal)}
-This Month (${new Date().toLocaleString("default", { month: "long", year: "numeric" })}): ${analytics.fmt(analytics.thisMonthTotal)}
-Top Merchants: ${analytics.topMerchants}
-Monthly Breakdown (recent): ${analytics.monthlyBreakdown}
-Total Individual Items on file: ${analytics.allItems.length}
+    const getMessageHistory = (sid) =>
+      new DynamoDBChatMessageHistory({
+        tableName:    MEMORY_TABLE,
+        sessionId:    sid,
+        partitionKey: "sessionId",
+        config: { region: process.env.AWS_REGION || "us-east-1" },
+      });
 
-Top 10 Highest-Priced Items:
-    ${analytics.topItems || "N/A"}
-────────────────────────────────────────────────────────────` : "";
-
-    const prompt = `You are Xpense AI, a friendly and precise personal finance assistant.
-You only answer questions based on the expense data provided below — do not fabricate data.
-If the data doesn't contain the answer, say "I don't have that information in your receipts."
-Be concise, friendly, and format numbers as currency (e.g. $12.50).
-${analyticsSection}
-
-── FULL EXPENSE HISTORY (${expenses.length} receipts) ────────────────────────
-${expContext}
-─────────────────────────────────────────────────────────────
-
-User Question: "${question}"
-
-Answer:`;
-
-    // ── 3. Call Gemini ─────────────────────────────────────────────────────
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-    const apiRes = await fetch(url, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.2,  // Low temperature = factual, consistent answers
-          topP: 0.9,
-          maxOutputTokens: 1024,
-        },
-      }),
+    const chain           = buildChain(expContext, analyticsSection);
+    const chainWithMemory = new RunnableWithMessageHistory({
+      runnable:           chain,
+      getMessageHistory,
+      inputMessagesKey:   "question",
+      historyMessagesKey: "history",
     });
 
-    const data = await apiRes.json();
+    const answer = await chainWithMemory.invoke(
+      { question },
+      { configurable: { sessionId } },
+    );
 
-    if (!apiRes.ok || !data.candidates) {
-      const errMsg = data.error?.message ?? JSON.stringify(data);
-      log("error", "Gemini API error", { errMsg });
-      return respond(500, { error: "AI service temporarily unavailable. Please try again." });
-    }
-
-    const answer = data.candidates[0]?.content?.parts?.[0]?.text
-      ?? "I wasn't able to generate an answer. Please try rephrasing your question.";
-
-    log("info", "Chat response generated", { userId, answerLength: answer.length });
-
-    return respond(200, { answer });
+    log("info", "Response generated", { userId, sessionId, answerLength: answer.length });
+    return respond(200, { answer, sessionId });
 
   } catch (err) {
     log("error", "Chat handler failed", { error: err.message, stack: err.stack });
