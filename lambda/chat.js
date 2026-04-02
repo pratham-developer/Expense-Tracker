@@ -1,6 +1,6 @@
 // chat.js — COMPLETE FILE
 import { DynamoDBClient, QueryCommand, ScanCommand }      from "@aws-sdk/client-dynamodb";
-import { ChatGoogleGenerativeAI }                          from "@langchain/google-genai";
+import { ChatOpenAI }                                      from "@langchain/openai";
 import { DynamoDBChatMessageHistory }                      from "@langchain/community/stores/message/dynamodb";
 import { RunnableWithMessageHistory }                      from "@langchain/core/runnables";
 import { ChatPromptTemplate, MessagesPlaceholder }         from "@langchain/core/prompts";
@@ -9,7 +9,7 @@ import { StringOutputParser }                              from "@langchain/core
 const dbClient     = new DynamoDBClient();
 const TABLE        = process.env.DYNAMODB_TABLE || "Expenses";
 const MEMORY_TABLE = process.env.MEMORY_TABLE   || "XpenseMemory";
-const GEMINI_MODEL = process.env.GEMINI_MODEL   || "gemini-2.5-flash";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
 const log = (level, msg, data = {}) =>
   console[level](JSON.stringify({ level: level.toUpperCase(), msg, ...data }));
@@ -151,11 +151,11 @@ const sanitizeQuestion = (q) => {
 };
 
 const buildChain = (expenseContext, analyticsSection) => {
-  const llm = new ChatGoogleGenerativeAI({
-    model:           GEMINI_MODEL,
-    apiKey:          process.env.GEMINI_API_KEY,
-    temperature:     0.2,
-    maxOutputTokens: 1024,
+  const llm = new ChatOpenAI({
+    model:          OPENAI_MODEL,
+    openAIApiKey:   process.env.OPENAI_API_KEY,
+    temperature:    0.2,
+    maxTokens:      4096,
   });
 
   const prompt = ChatPromptTemplate.fromMessages([
@@ -186,8 +186,8 @@ ${expenseContext}
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return respond(200, "");
 
-  if (!process.env.GEMINI_API_KEY) {
-    log("error", "GEMINI_API_KEY not set");
+  if (!process.env.OPENAI_API_KEY) {
+    log("error", "OPENAI_API_KEY not set");
     return respond(500, { error: "Server configuration error" });
   }
 

@@ -8,9 +8,11 @@ const s3       = new S3Client();
 const dynamodb = new DynamoDBClient();
 const ses      = new SESClient();
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SENDER_EMAIL   = process.env.SENDER_EMAIL;
 const TABLE          = process.env.DYNAMODB_TABLE || "Expenses";
+const OPENAI_MODEL   = process.env.OPENAI_MODEL   || "gpt-4.1-mini";
 const GEMINI_MODEL   = process.env.GEMINI_MODEL   || "gemini-2.5-flash";
 const MAX_RETRIES    = 3;
 
@@ -51,6 +53,8 @@ const streamToBuffer = (stream) =>
     stream.on("end", () => resolve(Buffer.concat(chunks)));
   });
 
+const isPdf = (key) => extname(key).toLowerCase() === ".pdf";
+
 const getMimeType = (key) => {
   const map = {
     ".jpg":  "image/jpeg",
@@ -67,29 +71,91 @@ const extractJson = (raw) => {
   const start   = cleaned.indexOf("{");
   const end     = cleaned.lastIndexOf("}");
   if (start === -1 || end === -1)
-    throw new Error(`No JSON found in Gemini response: ${cleaned.slice(0, 300)}`);
+    throw new Error(`No JSON found in response: ${cleaned.slice(0, 300)}`);
   return JSON.parse(cleaned.slice(start, end + 1));
 };
 
-const callGemini = async (payload, attempt = 1) => {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const res  = await fetch(url, {
+// ── OpenAI vision call — images only ─────────────────────────────────────────
+const callOpenAI = async (prompt, base64, mimeType, attempt = 1) => {
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  const res = await fetch(url, {
     method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(payload),
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model:       OPENAI_MODEL,
+      temperature: 0.1,
+      max_tokens:  1000,
+      messages: [{
+        role:    "user",
+        content: [
+          { type: "text", text: prompt },
+          {
+            type:      "image_url",
+            image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
+          },
+        ],
+      }],
+    }),
   });
+
   const data = await res.json();
 
-  if (!res.ok || !data.candidates) {
+  if (!res.ok || !data.choices?.length) {
+    const errMsg = data.error?.message ?? JSON.stringify(data);
+    if (attempt < MAX_RETRIES) {
+      log("warn", `OpenAI attempt ${attempt} failed, retrying`, { attempt, errMsg });
+      await sleep(2 ** attempt * 400);
+      return callOpenAI(prompt, base64, mimeType, attempt + 1);
+    }
+    throw new Error(`OpenAI failed after ${MAX_RETRIES} attempts: ${errMsg}`);
+  }
+
+  return data.choices[0].message.content;
+};
+
+// ── Gemini API call — PDFs only ───────────────────────────────────────────────
+const callGemini = async (prompt, base64, attempt = 1) => {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const res = await fetch(url, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{
+        parts: [
+          { text: prompt },
+          {
+            inline_data: {
+              mime_type: "application/pdf",
+              data:      base64,
+            },
+          },
+        ],
+      }],
+      generationConfig: {
+        temperature:     0.1,
+        maxOutputTokens: 1000,
+      },
+    }),
+  });
+
+  const data = await res.json();
+
+  if (!res.ok || !data.candidates?.length) {
     const errMsg = data.error?.message ?? JSON.stringify(data);
     if (attempt < MAX_RETRIES) {
       log("warn", `Gemini attempt ${attempt} failed, retrying`, { attempt, errMsg });
       await sleep(2 ** attempt * 400);
-      return callGemini(payload, attempt + 1);
+      return callGemini(prompt, base64, attempt + 1);
     }
     throw new Error(`Gemini failed after ${MAX_RETRIES} attempts: ${errMsg}`);
   }
-  return data;
+
+  return data.candidates[0].content.parts.map((p) => p.text ?? "").join("");
 };
 
 const isAlreadyProcessed = async (etag) => {
@@ -201,7 +267,41 @@ const buildEmail = (merchant, data, category) => {
   return { html, text };
 };
 
+const OCR_PROMPT = `You are a precise receipt OCR system. Analyze this receipt and return ONLY a valid JSON object — no markdown, no explanation, no extra text.
+
+Required JSON structure:
+{
+  "merchant": "Exact store/restaurant name from receipt",
+  "date": "YYYY-MM-DD (infer current year if not shown)",
+  "total": 123.45,
+  "items": [
+    { "name": "Item name exactly as on receipt", "price": 10.00 }
+  ],
+  "summary": "One sentence describing what was purchased",
+  "category": "Exactly one value from the list below"
+}
+
+Category options (pick the single best fit):
+- Food & Dining      → restaurants, cafes, Swiggy, Zomato
+- Groceries          → supermarkets, Blinkit, Zepto, DMart
+- Travel & Transport → flights, Uber, Ola, fuel stations (Indian Oil, HPCL, BPCL)
+- Shopping           → clothing, electronics, Amazon, Flipkart, Myntra
+- Entertainment      → movies, gaming, Netflix, Prime Video
+- Healthcare         → pharmacy, doctor visits, Apollo, MedPlus, labs
+- Utilities & Bills  → electricity, internet, phone recharge, BESCOM, Jio, Airtel
+- Education          → courses, books, tuition, Udemy, college fees
+- Other              → only if absolutely nothing else fits
+
+General rules:
+- Use "Unknown" for missing text fields, 0 for missing numbers
+- total must be a number (not a string)
+- All item prices must be numbers
+- date must be YYYY-MM-DD format
+- items array must include ALL line items visible on the receipt
+- category must be copied exactly as written above (case-sensitive)`;
+
 export const handler = async (event) => {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY env var");
   if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY env var");
   if (!SENDER_EMAIL)   throw new Error("Missing SENDER_EMAIL env var");
 
@@ -235,55 +335,19 @@ export const handler = async (event) => {
       const mimeType  = getMimeType(key);
       log("info", "File downloaded", { bytes: imgBuffer.length, mimeType });
 
-      // ── Single Gemini call: OCR + categorization in one pass ──────────────
-      log("info", "Calling Gemini (OCR + categorize)", { model: GEMINI_MODEL });
-      const geminiRes = await callGemini({
-        contents: [{
-          parts: [
-            {
-              text: `You are a precise receipt OCR system. Analyze this receipt image and return ONLY a valid JSON object — no markdown, no explanation, no extra text.
+      // ── Route to Gemini (PDF) or OpenAI (image) ───────────────────────────
+      let rawText;
+      if (isPdf(key)) {
+        log("info", "Calling Gemini (PDF OCR + categorize)", { model: GEMINI_MODEL });
+        rawText = await callGemini(OCR_PROMPT, base64);
+      } else {
+        log("info", "Calling OpenAI (image OCR + categorize)", { model: OPENAI_MODEL });
+        rawText = await callOpenAI(OCR_PROMPT, base64, mimeType);
+      }
 
-Required JSON structure:
-{
-  "merchant": "Exact store/restaurant name from receipt",
-  "date": "YYYY-MM-DD (infer current year if not shown)",
-  "total": 123.45,
-  "items": [
-    { "name": "Item name exactly as on receipt", "price": 10.00 }
-  ],
-  "summary": "One sentence describing what was purchased",
-  "category": "Exactly one value from the list below"
-}
+      const parsed = extractJson(rawText);
 
-Category options (pick the single best fit):
-- Food & Dining      → restaurants, cafes, Swiggy, Zomato
-- Groceries          → supermarkets, Blinkit, Zepto, DMart
-- Travel & Transport → flights, Uber, Ola, fuel stations (Indian Oil, HPCL, BPCL)
-- Shopping           → clothing, electronics, Amazon, Flipkart, Myntra
-- Entertainment      → movies, gaming, Netflix, Prime Video
-- Healthcare         → pharmacy, doctor visits, Apollo, MedPlus, labs
-- Utilities & Bills  → electricity, internet, phone recharge, BESCOM, Jio, Airtel
-- Education          → courses, books, tuition, Udemy, college fees
-- Other              → only if absolutely nothing else fits
-
-General rules:
-- Use "Unknown" for missing text fields, 0 for missing numbers
-- total must be a number (not a string)
-- All item prices must be numbers
-- date must be YYYY-MM-DD format
-- items array must include ALL line items visible on the receipt
-- category must be copied exactly as written above (case-sensitive)`,
-            },
-            { inline_data: { mime_type: mimeType, data: base64 } },
-          ],
-        }],
-        generationConfig: { temperature: 0.1, topP: 0.8 },
-      });
-
-      const rawText = geminiRes.candidates[0].content.parts[0].text;
-      const parsed  = extractJson(rawText);
-
-      // Guard: fall back to "Other" if Gemini returns an unrecognised string
+      // Guard: fall back to "Other" if model returns an unrecognised string
       const category = VALID_CATEGORIES.has(parsed.category) ? parsed.category : "Other";
 
       log("info", "OCR + categorization complete", {
