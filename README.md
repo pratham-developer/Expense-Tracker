@@ -8,4 +8,4 @@
 - 23BCE0256 - Vedant Kurlekar
 
 **Cloud Provider:** AWS (Amazon Web Services)  
-**GenAI Platform:** Google Gemini
+**GenAI Platforms:** Google Gemini & OpenAI

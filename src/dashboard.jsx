@@ -1305,7 +1305,7 @@ Use only the data above. Produce real dollar estimates.`;
 
                   <div className="chart-card chart-card-wide forecast-card">
                     <div className="chart-title-row">
-                      <div className="chart-title">✨ AI Spending Forecast</div>
+                      <div className="chart-title">AI Spending Forecast</div>
                       <button
                         className="forecast-btn"
                         onClick={handleForecast}
