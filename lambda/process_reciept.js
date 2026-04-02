@@ -3,9 +3,6 @@ import { DynamoDBClient, PutItemCommand, GetItemCommand } from "@aws-sdk/client-
 import { S3Client, GetObjectCommand }                     from "@aws-sdk/client-s3";
 import { SESClient, SendEmailCommand }                    from "@aws-sdk/client-ses";
 import { extname }                                        from "path";
-import { ChatGoogleGenerativeAI }                         from "@langchain/google-genai";
-import { PromptTemplate }                                 from "@langchain/core/prompts";
-import { StringOutputParser }                             from "@langchain/core/output_parsers";
 
 const s3       = new S3Client();
 const dynamodb = new DynamoDBClient();
@@ -17,7 +14,7 @@ const TABLE          = process.env.DYNAMODB_TABLE || "Expenses";
 const GEMINI_MODEL   = process.env.GEMINI_MODEL   || "gemini-2.5-flash";
 const MAX_RETRIES    = 3;
 
-const CATEGORIES = [
+const VALID_CATEGORIES = new Set([
   "Food & Dining",
   "Groceries",
   "Travel & Transport",
@@ -27,7 +24,19 @@ const CATEGORIES = [
   "Utilities & Bills",
   "Education",
   "Other",
-];
+]);
+
+const CATEGORY_META = {
+  "Food & Dining":      { emoji: "🍽️", color: "#F59E0B", bg: "#FFFBEB", border: "#FDE68A" },
+  "Groceries":          { emoji: "🛒", color: "#10B981", bg: "#ECFDF5", border: "#A7F3D0" },
+  "Travel & Transport": { emoji: "✈️", color: "#3B82F6", bg: "#EFF6FF", border: "#BFDBFE" },
+  "Shopping":           { emoji: "🛍️", color: "#8B5CF6", bg: "#F5F3FF", border: "#DDD6FE" },
+  "Entertainment":      { emoji: "🎬", color: "#EC4899", bg: "#FDF2F8", border: "#FBCFE8" },
+  "Healthcare":         { emoji: "💊", color: "#EF4444", bg: "#FEF2F2", border: "#FECACA" },
+  "Utilities & Bills":  { emoji: "⚡", color: "#F97316", bg: "#FFF7ED", border: "#FED7AA" },
+  "Education":          { emoji: "📚", color: "#06B6D4", bg: "#ECFEFF", border: "#A5F3FC" },
+  "Other":              { emoji: "📦", color: "#6B7280", bg: "#F9FAFB", border: "#E5E7EB" },
+};
 
 const log = (level, msg, data = {}) =>
   console[level](JSON.stringify({ level: level.toUpperCase(), msg, ...data }));
@@ -83,44 +92,6 @@ const callGemini = async (payload, attempt = 1) => {
   return data;
 };
 
-const categorizeExpense = async (merchant, items, summary) => {
-  try {
-    const llm = new ChatGoogleGenerativeAI({
-      model:           GEMINI_MODEL,
-      apiKey:          GEMINI_API_KEY,
-      temperature:     0,
-      maxOutputTokens: 20,
-    });
-
-    const prompt = PromptTemplate.fromTemplate(
-      `Classify this expense into exactly one of the listed categories.
-
-Merchant : {merchant}
-Items    : {items}
-Summary  : {summary}
-
-Categories: ${CATEGORIES.join(", ")}
-
-Reply with ONLY the category name — no punctuation, no explanation.`
-    );
-
-    const chain  = prompt.pipe(llm).pipe(new StringOutputParser());
-    const result = await chain.invoke({
-      merchant,
-      items:   items.map((i) => i.name).join(", ").slice(0, 200),
-      summary: summary.slice(0, 200),
-    });
-
-    const matched = CATEGORIES.find(
-      (c) => c.toLowerCase() === result.trim().toLowerCase()
-    );
-    return matched ?? "Other";
-  } catch (err) {
-    log("warn", "Categorization failed, defaulting to Other", { error: err.message });
-    return "Other";
-  }
-};
-
 const isAlreadyProcessed = async (etag) => {
   const res = await dynamodb.send(new GetItemCommand({
     TableName: TABLE,
@@ -142,59 +113,80 @@ const markProcessed = (etag) =>
 const buildEmail = (merchant, data, category) => {
   const fmt   = (n) => `$${parseFloat(n).toFixed(2)}`;
   const items = data.items ?? [];
+  const meta  = CATEGORY_META[category] ?? CATEGORY_META["Other"];
 
   const itemRows = items
     .map(
       (i) => `
       <tr>
-        <td style="padding:8px 16px;border-bottom:1px solid #F3F4F6;color:#374151;font-size:14px;">${i.name}</td>
-        <td style="padding:8px 16px;border-bottom:1px solid #F3F4F6;text-align:right;font-weight:600;color:#111827;font-size:14px;">${fmt(i.price)}</td>
+        <td style="padding:10px 16px;border-bottom:1px solid #F3F4F6;color:#374151;font-size:14px;">${i.name}</td>
+        <td style="padding:10px 16px;border-bottom:1px solid #F3F4F6;text-align:right;font-weight:600;color:#111827;font-size:14px;">${fmt(i.price)}</td>
       </tr>`
     )
     .join("");
 
   const html = `<!DOCTYPE html>
 <html lang="en">
-<body style="margin:0;padding:32px 16px;background:#F5F5F5;font-family:'Segoe UI',Arial,sans-serif;">
-  <div style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
-    <div style="background:linear-gradient(135deg,#4F46E5 0%,#6366F1 100%);padding:32px;color:#ffffff;">
-      <div style="font-size:12px;letter-spacing:1px;text-transform:uppercase;opacity:0.75;margin-bottom:6px;">Receipt Processed ✓</div>
-      <div style="font-size:26px;font-weight:800;letter-spacing:-0.5px;">${data.merchant}</div>
-      <div style="font-size:13px;opacity:0.7;margin-top:6px;">${data.date}</div>
-      <div style="margin-top:8px;display:inline-block;background:rgba(255,255,255,0.2);border-radius:20px;padding:4px 12px;font-size:12px;">
-        📂 ${category}
+<body style="margin:0;padding:32px 16px;background:#F0F4FF;font-family:'Segoe UI',Arial,sans-serif;">
+  <div style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:20px;overflow:hidden;box-shadow:0 8px 32px rgba(79,70,229,0.12);">
+
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#4F46E5 0%,#6366F1 100%);padding:32px 32px 24px;">
+      <div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;opacity:0.65;margin-bottom:8px;color:#fff;">Receipt Processed ✓</div>
+      <div style="font-size:26px;font-weight:800;letter-spacing:-0.5px;color:#fff;">${data.merchant}</div>
+      <div style="font-size:13px;opacity:0.65;margin-top:4px;color:#fff;">${data.date}</div>
+    </div>
+
+    <!-- Category Badge — full-width stripe -->
+    <div style="background:${meta.bg};border-top:3px solid ${meta.border};border-bottom:3px solid ${meta.border};padding:14px 32px;display:flex;align-items:center;gap:12px;">
+      <span style="font-size:22px;line-height:1;">${meta.emoji}</span>
+      <div>
+        <div style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#9CA3AF;margin-bottom:2px;">Category</div>
+        <div style="font-size:15px;font-weight:700;color:${meta.color};">${category}</div>
       </div>
     </div>
+
+    <!-- Body -->
     <div style="padding:28px 32px;">
+
+      <!-- Summary -->
       <div style="font-size:11px;color:#9CA3AF;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:8px;">Summary</div>
-      <p style="margin:0 0 24px;color:#4B5563;font-size:14px;line-height:1.65;">${data.summary}</p>
+      <p style="margin:0 0 28px;color:#4B5563;font-size:14px;line-height:1.65;">${data.summary}</p>
+
+      <!-- Line Items -->
       ${itemRows ? `
       <div style="font-size:11px;color:#9CA3AF;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:8px;">Line Items (${items.length})</div>
-      <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-radius:10px;overflow:hidden;border:1px solid #F3F4F6;">
         <thead>
           <tr style="background:#F9FAFB;">
-            <th style="padding:8px 16px;text-align:left;font-size:11px;color:#9CA3AF;">Item</th>
-            <th style="padding:8px 16px;text-align:right;font-size:11px;color:#9CA3AF;">Price</th>
+            <th style="padding:10px 16px;text-align:left;font-size:11px;color:#9CA3AF;font-weight:600;">Item</th>
+            <th style="padding:10px 16px;text-align:right;font-size:11px;color:#9CA3AF;font-weight:600;">Price</th>
           </tr>
         </thead>
         <tbody>${itemRows}</tbody>
       </table>` : ""}
-      <div style="background:#EEF2FF;border-radius:10px;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;">
+
+      <!-- Total -->
+      <div style="background:linear-gradient(135deg,#EEF2FF,#E0E7FF);border-radius:12px;padding:18px 24px;display:flex;justify-content:space-between;align-items:center;border:1px solid #C7D2FE;">
         <span style="color:#4F46E5;font-size:14px;font-weight:600;">Total Charged</span>
-        <span style="color:#312E81;font-size:22px;font-weight:800;">${fmt(data.total)}</span>
+        <span style="color:#312E81;font-size:24px;font-weight:800;">${fmt(data.total)}</span>
       </div>
     </div>
-    <div style="padding:16px 32px;background:#F9FAFB;border-top:1px solid #F3F4F6;text-align:center;font-size:12px;color:#9CA3AF;">
-      Processed by <strong style="color:#4F46E5;">Xpense</strong> · ${new Date().toUTCString()}
+
+    <!-- Footer -->
+    <div style="padding:16px 32px;background:#F9FAFB;border-top:1px solid #F3F4F6;display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:12px;color:#9CA3AF;">Processed by <strong style="color:#4F46E5;">Xpense</strong></span>
+      <span style="font-size:11px;color:#D1D5DB;">${new Date().toUTCString()}</span>
     </div>
+
   </div>
 </body>
 </html>`;
 
   const text = [
     `Receipt Processed: ${data.merchant}`,
-    `Category: ${category}`,
     `Date: ${data.date}`,
+    `Category: ${meta.emoji} ${category}`,
     `Total: ${fmt(data.total)}`,
     "",
     `Summary: ${data.summary}`,
@@ -202,6 +194,8 @@ const buildEmail = (merchant, data, category) => {
     items.length
       ? `Items:\n${items.map((i) => `  • ${i.name}: ${fmt(i.price)}`).join("\n")}`
       : "",
+    "",
+    `Processed by Xpense · ${new Date().toUTCString()}`,
   ].join("\n");
 
   return { html, text };
@@ -241,7 +235,8 @@ export const handler = async (event) => {
       const mimeType  = getMimeType(key);
       log("info", "File downloaded", { bytes: imgBuffer.length, mimeType });
 
-      log("info", "Calling Gemini OCR", { model: GEMINI_MODEL });
+      // ── Single Gemini call: OCR + categorization in one pass ──────────────
+      log("info", "Calling Gemini (OCR + categorize)", { model: GEMINI_MODEL });
       const geminiRes = await callGemini({
         contents: [{
           parts: [
@@ -256,15 +251,28 @@ Required JSON structure:
   "items": [
     { "name": "Item name exactly as on receipt", "price": 10.00 }
   ],
-  "summary": "One sentence describing what was purchased"
+  "summary": "One sentence describing what was purchased",
+  "category": "Exactly one value from the list below"
 }
 
-Rules:
+Category options (pick the single best fit):
+- Food & Dining      → restaurants, cafes, Swiggy, Zomato
+- Groceries          → supermarkets, Blinkit, Zepto, DMart
+- Travel & Transport → flights, Uber, Ola, fuel stations (Indian Oil, HPCL, BPCL)
+- Shopping           → clothing, electronics, Amazon, Flipkart, Myntra
+- Entertainment      → movies, gaming, Netflix, Prime Video
+- Healthcare         → pharmacy, doctor visits, Apollo, MedPlus, labs
+- Utilities & Bills  → electricity, internet, phone recharge, BESCOM, Jio, Airtel
+- Education          → courses, books, tuition, Udemy, college fees
+- Other              → only if absolutely nothing else fits
+
+General rules:
 - Use "Unknown" for missing text fields, 0 for missing numbers
 - total must be a number (not a string)
 - All item prices must be numbers
 - date must be YYYY-MM-DD format
-- items array must include ALL line items visible on the receipt`,
+- items array must include ALL line items visible on the receipt
+- category must be copied exactly as written above (case-sensitive)`,
             },
             { inline_data: { mime_type: mimeType, data: base64 } },
           ],
@@ -274,19 +282,17 @@ Rules:
 
       const rawText = geminiRes.candidates[0].content.parts[0].text;
       const parsed  = extractJson(rawText);
-      log("info", "OCR complete", {
+
+      // Guard: fall back to "Other" if Gemini returns an unrecognised string
+      const category = VALID_CATEGORIES.has(parsed.category) ? parsed.category : "Other";
+
+      log("info", "OCR + categorization complete", {
         merchant:  parsed.merchant,
         total:     parsed.total,
         itemCount: parsed.items?.length ?? 0,
+        category,
       });
-
-      log("info", "Categorizing expense via LangChain");
-      const category = await categorizeExpense(
-        parsed.merchant  ?? "Unknown",
-        parsed.items     ?? [],
-        parsed.summary   ?? ""
-      );
-      log("info", "Category assigned", { category });
+      // ─────────────────────────────────────────────────────────────────────
 
       const expenseId = Date.now().toString();
 
@@ -321,7 +327,7 @@ Rules:
             Destination: { ToAddresses: [userEmail] },
             Message: {
               Subject: {
-                Data: `🧾 Receipt Processed: ${parsed.merchant} — $${parseFloat(parsed.total).toFixed(2)} · ${category}`,
+                Data: `🧾 ${parsed.merchant} — $${parseFloat(parsed.total).toFixed(2)} · ${CATEGORY_META[category]?.emoji ?? "📦"} ${category}`,
               },
               Body: {
                 Html: { Data: html },
